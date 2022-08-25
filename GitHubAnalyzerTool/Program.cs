@@ -23,6 +23,14 @@ namespace GitHubAnalyzerTool {
         static GitHubClient client;
         static List<SearchResult> searchResults;
         static Task[] tasks;
+        static HashSet<Repository> repositoryData = new HashSet<Repository>();
+        static readonly DateRange[] DateRanges = new DateRange[] {
+            new DateRange(new DateTimeOffset(new DateTime(2005, 1, 1)), new DateTimeOffset(new DateTime(2008, 1, 1))),
+            new DateRange(new DateTimeOffset(new DateTime(2008, 1, 1)), new DateTimeOffset(new DateTime(2011, 1, 1))),
+            new DateRange(new DateTimeOffset(new DateTime(2011, 1, 1)), new DateTimeOffset(new DateTime(2014, 1, 1))),
+            new DateRange(new DateTimeOffset(new DateTime(2014, 1, 1)), new DateTimeOffset(new DateTime(2017, 1, 1))),
+            new DateRange(new DateTimeOffset(new DateTime(2017, 1, 1)), new DateTimeOffset(DateTime.Now))
+        };
         static void Main(string[] args) {
             Console.WriteLine("configuration...");
             string text = File.ReadAllText("keywords.cnfg");
@@ -51,9 +59,15 @@ namespace GitHubAnalyzerTool {
                     CreateHeader(sheet);
                     for(var i = 0; i < searchResults.Count; i++) {
                         var item = searchResults[i];
-                        using(IXlRow row = sheet.CreateRow())
+                        using(IXlRow row = sheet.CreateRow()) {
                             WriteRepositoryData(row, item.Repository);
-                        for(int index = 0; index < item.Contributors.Count; index++) {
+                            if(item.Contributors.Count > 0) {
+                                var author = item.Contributors[0];
+                                WriteUserData(row, author);
+                            }
+                        }
+                        sheet.BeginGroup(true);
+                        for(int index = 1; index < item.Contributors.Count; index++) {
                             using(IXlRow row = sheet.CreateRow()) {
                                 var contributor = item.Contributors[index];
                                 CreateCell(row, null);
@@ -61,6 +75,7 @@ namespace GitHubAnalyzerTool {
                                 WriteUserData(row, contributor);
                             }
                         }
+                        sheet.EndGroup();
                     }
                     ApplyAutoFilter(sheet);
                 }
@@ -71,33 +86,42 @@ namespace GitHubAnalyzerTool {
             client.Credentials = new Credentials(authToken);
             for(int i = 0; i < keywords.Length; i++) {
                 string keyword = keywords[i];
-                var task = Task.Run(() => SearchRepositories(keyword));
-                tasks[i] = task.ContinueWith(t => { FindContributors(t, keyword); });
+                for(int dr = 0; dr < DateRanges.Length; dr++) {
+                    DateRange range = DateRanges[dr];
+                    var task = Task.Run(() => SearchRepositories(keyword, range));
+                    tasks[i] = task.ContinueWith(t => { FindContributors(t, keyword, range); });
+                }
             }
         }
-        static void FindContributors(Task<SearchRepositoryResult> task, string keyword) {
+        static void FindContributors(Task<SearchRepositoryResult> task, string keyword, DateRange range) {
             if(task.Status != TaskStatus.RanToCompletion)
                 return;
             SearchRepositoryResult result = task.Result;
             if(result == null)
                 return;
-            Console.WriteLine($"search for keyword: '{keyword}'");
+            Console.WriteLine($"search for keyword: '{keyword}' created between '{range}'");
             for(int r = 0; r < result.Items.Count; r++) {
                 var repository = result.Items[r];
-                if(repository.Owner.Type != AccountType.Organization) {
-                    SearchResult sr = new SearchResult();
-                    sr.Repository = repository;
-                    sr.Contributors = new List<User>();
-                    var list = client.Repository.GetAllContributors(repository.Id);
-                    var listResult = list.Result;
-                    for(int i = 0; i < listResult.Count; i++) {
-                        var userTask = client.User.Get(listResult[i].Login);
-                        sr.Contributors.Add(userTask.Result);
-                    }
-                    searchResults.Add(sr);
-                }
+                if(repository.Owner.Type == AccountType.Organization)
+                    continue;
+                if(repositoryData.Contains(repository))
+                    continue;
+                repositoryData.Add(repository);
+                SearchResult sr = new SearchResult();
+                sr.Repository = repository;
+                sr.Contributors = new List<User>();
+                FindContributorsCore(repository, sr);
             }
-            Console.WriteLine($"keyword: '{keyword}' processed");
+            Console.WriteLine($"keyword: '{keyword}' in range {range} processed'");
+        }
+        static void FindContributorsCore(Repository repository, SearchResult sr) {
+            var list = client.Repository.GetAllContributors(repository.Id, false);
+            var listResult = list.Result;
+            for(int i = 0; i < listResult.Count; i++) {
+                var userTask = client.User.Get(listResult[i].Login);
+                sr.Contributors.Add(userTask.Result);
+            }
+            searchResults.Add(sr);
         }
         static void WriteRepositoryData(IXlRow row, Repository repo) {
             CreateCell(row, repo.Name);
@@ -109,7 +133,6 @@ namespace GitHubAnalyzerTool {
             CreateCell(row, userProfile.Location);
             CreateCell(row, userProfile.Company);
             CreateCell(row, IsOwnerHireable(userProfile));
-            CreateCell(row, userProfile.Bio);
             CreateCell(row, userProfile.Email);
         }
         static void ApplyAutoFilter(IXlSheet sheet) {
@@ -130,7 +153,6 @@ namespace GitHubAnalyzerTool {
                 CreateHeaderCell(row, nameof(Account.Location));
                 CreateHeaderCell(row, nameof(Account.Company));
                 CreateHeaderCell(row, nameof(Account.Hireable));
-                CreateHeaderCell(row, nameof(Account.Bio));
                 CreateHeaderCell(row, nameof(Account.Email));
             }
         }
@@ -146,11 +168,18 @@ namespace GitHubAnalyzerTool {
                 cell.Formatting.Font.Bold = true;
             }
         }
-        static async Task<SearchRepositoryResult> SearchRepositories(string term) {
+        static async Task<SearchRepositoryResult> SearchRepositories(string term, DateRange range) {
             var request = new SearchRepositoriesRequest(term) {
                 Language = Language.CSharp,
                 SortField = RepoSearchSort.Stars,
-                Order = SortDirection.Descending
+                Size = Range.GreaterThan(100),
+                Order = SortDirection.Descending,
+                Page = 1,
+                PerPage = 1000,
+                In = new InQualifier[] { InQualifier.Description, InQualifier.Name, InQualifier.Readme },
+                Updated = DateRange.Between(new DateTimeOffset(new DateTime(2018, 1, 1)), new DateTimeOffset(DateTime.Now)),
+                Created = range,
+                Stars = Range.GreaterThanOrEquals(10)
             };
             return await client.Search.SearchRepo(request);
         }
